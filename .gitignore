@@ -1,0 +1,6 @@
+# built binary
+/guest-run
+# go
+*.exe
+*.test
+*.out
