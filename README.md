@@ -32,6 +32,12 @@ the way in. Ask me how I know.
 
 ## Install
 
+Grab a prebuilt binary from the [releases page](https://github.com/linuxelitebr/kubevirt-guest-run/releases):
+one archive per platform (Linux, macOS, Windows; amd64 and arm64), each with the
+binary, this README and the license. Unpack it and drop `guest-run` on your PATH.
+
+Or build it yourself:
+
 ```bash
 go build -o guest-run .
 # or
@@ -135,6 +141,20 @@ grant.
 
 The full story, with the measurements, is in the post:
 https://linuxelite.com.br/blog/guest-exec-vm-no-network/
+
+## Releasing
+
+Builds happen locally, not in CI (this org keeps GitHub Actions billing off).
+`release.sh` cross-compiles every supported platform, packages one archive per
+platform plus a `SHA256SUMS`, and can publish the GitHub release:
+
+```bash
+./release.sh            # build + package into dist/
+./release.sh --publish  # the above, then create the release (needs gh)
+```
+
+The version comes from the `version` const in `main.go`. Bump it there, run the
+script. No CI, no tags to babysit.
 
 ## License
 
