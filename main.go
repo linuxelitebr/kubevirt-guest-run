@@ -24,7 +24,7 @@ import (
 	"unicode/utf16"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 // usage prints on -h and on a usage error. Works with no oc and no cluster.
 func usage() {
@@ -38,6 +38,7 @@ MODES (pick one)
   -ps-file FILE        PowerShell script from a file, via -EncodedCommand (- = stdin)
   -sh "COMMAND"        /bin/sh -c in the guest (Linux)
   -- PATH [ARGS]       exec a binary directly, no shell (any OS)
+  -put FILE -dest P    push a local FILE into the guest at path P, no network
 
 OPTIONS
   -vm NAME             VM name (required)
@@ -78,6 +79,7 @@ type opts struct {
 func main() {
 	o := &opts{namespace: "default", timeout: 60 * time.Second, interval: time.Second}
 	var psInline, psFile, shInline string
+	var putLocal, putDest string
 	var showHelp, showVersion bool
 
 	// Hand-rolled parser: Go's flag package dislikes mixing flags with a
@@ -123,6 +125,10 @@ func main() {
 			psFile = need(a)
 		case "-sh", "--sh":
 			shInline = need(a)
+		case "-put", "--put":
+			putLocal = need(a)
+		case "-dest", "--dest":
+			putDest = need(a)
 		case "--":
 			rest = args[i+1:]
 			i = len(args)
@@ -142,6 +148,21 @@ func main() {
 	if o.vm == "" {
 		usage()
 		fail("missing -vm")
+	}
+
+	// -put is a different operation (push a file in), not a guest-exec. It is
+	// mutually exclusive with the command modes.
+	if putLocal != "" {
+		if psInline != "" || psFile != "" || shInline != "" || len(rest) > 0 {
+			fail("-put cannot be combined with a command mode")
+		}
+		if putDest == "" {
+			fail("-put needs -dest with the destination path inside the guest")
+		}
+		if err := runPut(o, putLocal, putDest); err != nil {
+			fail("%v", err)
+		}
+		return
 	}
 
 	// Build the guest-exec payload from the chosen mode. One mode at a time.
@@ -345,6 +366,147 @@ func finish(o *opts, sr statusResp, rawJSON string) error {
 		os.Exit(code)
 	}
 	return nil
+}
+
+// --- file push (guest-file-open/write/close) --------------------------------
+
+// putChunk is the raw bytes per write. Its base64 (~4/3 larger) plus the JSON
+// wrapper is one argument to virsh, so it must stay under the Linux
+// MAX_ARG_STRLEN of 128 KiB. 64 KiB raw leaves comfortable headroom.
+const putChunk = 64 * 1024
+
+type fileOpenResp struct {
+	Return int `json:"return"`
+}
+
+type fileWriteResp struct {
+	Return struct {
+		Count int  `json:"count"`
+		Eof   bool `json:"eof"`
+	} `json:"return"`
+}
+
+// runPut streams a local file into the guest over the agent's file RPCs, with no
+// guest network involved. It opens the destination, writes it in chunks, and
+// closes it, failing with the reason if any step does. Good for pushing an
+// installer into a VM whose network is broken, which is the whole point.
+func runPut(o *opts, local, dest string) error {
+	data, err := os.ReadFile(local)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", local, err)
+	}
+
+	if !o.force {
+		if err := checkAgent(o); err != nil {
+			return err
+		}
+	}
+	pod, err := resolvePod(o)
+	if err != nil {
+		return err
+	}
+	domain := o.namespace + "_" + o.vm
+	o.logf("pod: %s", pod)
+
+	// Best-effort: create the destination's parent directory, so a push to a
+	// path like C:\...\newdir\file.msi does not fail because newdir is missing.
+	o.ensureParentDir(pod, domain, dest)
+
+	// Open the destination for binary write.
+	openReq, _ := json.Marshal(map[string]any{
+		"execute":   "guest-file-open",
+		"arguments": map[string]any{"path": dest, "mode": "wb"},
+	})
+	out, stderr, err := o.agentCommand(pod, domain, string(openReq))
+	if err != nil {
+		return fmt.Errorf("opening %q in the guest: %s", dest, firstLine(stderr, err))
+	}
+	var fo fileOpenResp
+	if e := json.Unmarshal([]byte(out), &fo); e != nil {
+		return fmt.Errorf("unexpected guest-file-open response: %s", strings.TrimSpace(out+stderr))
+	}
+	handle := fo.Return
+
+	// Write in chunks, tracking how many bytes the guest acknowledges.
+	written, total := 0, len(data)
+	for off := 0; off < total; off += putChunk {
+		end := off + putChunk
+		if end > total {
+			end = total
+		}
+		b64 := base64.StdEncoding.EncodeToString(data[off:end])
+		wReq, _ := json.Marshal(map[string]any{
+			"execute":   "guest-file-write",
+			"arguments": map[string]any{"handle": handle, "buf-b64": b64},
+		})
+		wOut, wErr, e := o.agentCommand(pod, domain, string(wReq))
+		if e != nil {
+			o.closeHandle(pod, domain, handle)
+			return fmt.Errorf("writing at byte %d of %d: %s", off, total, firstLine(wErr, e))
+		}
+		var fw fileWriteResp
+		if je := json.Unmarshal([]byte(wOut), &fw); je != nil {
+			o.closeHandle(pod, domain, handle)
+			return fmt.Errorf("unexpected guest-file-write response at byte %d: %s", off, strings.TrimSpace(wOut+wErr))
+		}
+		written += fw.Return.Count
+		o.logf("wrote %d/%d bytes", written, total)
+	}
+
+	o.closeHandle(pod, domain, handle)
+
+	if written != total {
+		return fmt.Errorf("short write: the guest acknowledged %d of %d bytes", written, total)
+	}
+	fmt.Fprintf(os.Stderr, "guest-run: wrote %d bytes to %s\n", written, dest)
+	return nil
+}
+
+// ensureParentDir best-effort creates the parent directory of dest in the guest.
+// Windows paths (with a backslash) get a cmd.exe md; others get mkdir -p. The
+// result is ignored: if the directory already exists the open just succeeds, and
+// if the create genuinely failed the open reports the real reason.
+func (o *opts) ensureParentDir(pod, domain, dest string) {
+	var cmdPath string
+	var args []string
+	if strings.Contains(dest, `\`) {
+		i := strings.LastIndex(dest, `\`)
+		if i <= 0 {
+			return
+		}
+		parent := dest[:i]
+		cmdPath = `cmd.exe`
+		args = []string{"/c", "md", parent}
+	} else if strings.Contains(dest, "/") {
+		i := strings.LastIndex(dest, "/")
+		if i <= 0 {
+			return
+		}
+		parent := dest[:i]
+		cmdPath = "/bin/mkdir"
+		args = []string{"-p", parent}
+	} else {
+		return
+	}
+	var req guestExecReq
+	req.Execute = "guest-exec"
+	req.Arguments.Path = cmdPath
+	req.Arguments.Arg = args
+	reqJSON, _ := json.Marshal(req)
+	if _, _, err := o.agentCommand(pod, domain, string(reqJSON)); err != nil {
+		o.logf("ensureParentDir: %v (continuing)", err)
+	}
+}
+
+// closeHandle closes a guest file handle, best-effort.
+func (o *opts) closeHandle(pod, domain string, handle int) {
+	req, _ := json.Marshal(map[string]any{
+		"execute":   "guest-file-close",
+		"arguments": map[string]any{"handle": handle},
+	})
+	if _, _, err := o.agentCommand(pod, domain, string(req)); err != nil {
+		o.logf("warning: guest-file-close failed: %v", err)
+	}
 }
 
 // --- oc/kubectl ------------------------------------------------------------

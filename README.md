@@ -62,6 +62,13 @@ Modes, pick one:
 | `-ps-file FILE` | PowerShell script from a file, via `-EncodedCommand` (`-` = stdin) |
 | `-sh "COMMAND"` | `/bin/sh -c` in the guest (Linux) |
 | `-- PATH [ARGS]` | exec a binary directly, no shell (any OS) |
+| `-put FILE -dest P` | push a local FILE into the guest at path P, no guest network |
+
+`-put` streams the file in over the agent's own file RPCs
+(`guest-file-open`/`write`/`close`), so it works on a VM whose network is down.
+That is the point: get an installer, a script or a config into a VM you can only
+reach through the agent. It is one-directional (host to guest) and verifies the
+byte count the guest acknowledged.
 
 Options that matter:
 
