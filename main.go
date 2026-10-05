@@ -12,6 +12,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
@@ -19,12 +20,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf16"
 )
 
-const version = "0.2.0"
+const version = "0.3.0"
 
 // usage prints on -h and on a usage error. Works with no oc and no cluster.
 func usage() {
@@ -39,6 +41,7 @@ MODES (pick one)
   -sh "COMMAND"        /bin/sh -c in the guest (Linux)
   -- PATH [ARGS]       exec a binary directly, no shell (any OS)
   -put FILE -dest P    push a local FILE into the guest at path P, no network
+  -put-dir DIR -dest P push a local DIR into guest dir P (zip + Expand-Archive, Windows)
 
 OPTIONS
   -vm NAME             VM name (required)
@@ -79,7 +82,7 @@ type opts struct {
 func main() {
 	o := &opts{namespace: "default", timeout: 60 * time.Second, interval: time.Second}
 	var psInline, psFile, shInline string
-	var putLocal, putDest string
+	var putLocal, putDest, putDirLocal string
 	var showHelp, showVersion bool
 
 	// Hand-rolled parser: Go's flag package dislikes mixing flags with a
@@ -127,6 +130,8 @@ func main() {
 			shInline = need(a)
 		case "-put", "--put":
 			putLocal = need(a)
+		case "-put-dir", "--put-dir":
+			putDirLocal = need(a)
 		case "-dest", "--dest":
 			putDest = need(a)
 		case "--":
@@ -153,13 +158,26 @@ func main() {
 	// -put is a different operation (push a file in), not a guest-exec. It is
 	// mutually exclusive with the command modes.
 	if putLocal != "" {
-		if psInline != "" || psFile != "" || shInline != "" || len(rest) > 0 {
+		if psInline != "" || psFile != "" || shInline != "" || len(rest) > 0 || putDirLocal != "" {
 			fail("-put cannot be combined with a command mode")
 		}
 		if putDest == "" {
 			fail("-put needs -dest with the destination path inside the guest")
 		}
 		if err := runPut(o, putLocal, putDest); err != nil {
+			fail("%v", err)
+		}
+		return
+	}
+
+	if putDirLocal != "" {
+		if psInline != "" || psFile != "" || shInline != "" || len(rest) > 0 || putLocal != "" {
+			fail("-put-dir cannot be combined with another mode")
+		}
+		if putDest == "" {
+			fail("-put-dir needs -dest with the destination directory inside the guest")
+		}
+		if err := runPutDir(o, putDirLocal, putDest); err != nil {
 			fail("%v", err)
 		}
 		return
@@ -605,4 +623,154 @@ func mustDur(s string) time.Duration {
 func fail(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "guest-run: "+format+"\n", a...)
 	os.Exit(2)
+}
+
+func psSingleQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// execAndWait fires a guest-exec, waits for it to finish, and returns the exit
+// code plus decoded stdout/stderr, without exiting the process (unlike run,
+// which is terminal). Used for the intermediate steps of -put-dir.
+func (o *opts) execAndWait(path string, cmdArgs []string) (int, string, string, error) {
+	domain := o.namespace + "_" + o.vm
+	pod, err := resolvePod(o)
+	if err != nil {
+		return 0, "", "", err
+	}
+	var req guestExecReq
+	req.Execute = "guest-exec"
+	req.Arguments.Path = path
+	req.Arguments.Arg = cmdArgs
+	req.Arguments.CaptureOutput = true
+	reqJSON, _ := json.Marshal(req)
+	out, stderr, err := o.agentCommand(pod, domain, string(reqJSON))
+	if err != nil {
+		return 0, "", "", fmt.Errorf("firing guest-exec: %s", firstLine(stderr, err))
+	}
+	var er execResp
+	if e := json.Unmarshal([]byte(out), &er); e != nil || er.Return.Pid == 0 {
+		return 0, "", "", fmt.Errorf("unexpected guest-exec response: %s", strings.TrimSpace(out+stderr))
+	}
+	statusReq := fmt.Sprintf(`{"execute":"guest-exec-status","arguments":{"pid":%d}}`, er.Return.Pid)
+	deadline := time.Now().Add(o.timeout)
+	for {
+		sOut, sErr, e := o.agentCommand(pod, domain, statusReq)
+		if e != nil {
+			return 0, "", "", fmt.Errorf("querying status: %s", firstLine(sErr, e))
+		}
+		var sr statusResp
+		if e := json.Unmarshal([]byte(sOut), &sr); e != nil {
+			return 0, "", "", fmt.Errorf("unreadable status: %s", strings.TrimSpace(sOut))
+		}
+		if sr.Return.Exited {
+			code := 0
+			if sr.Return.ExitCode != nil {
+				code = *sr.Return.ExitCode
+			} else if sr.Return.Signal != nil {
+				code = 128 + *sr.Return.Signal
+			}
+			outB, _ := base64.StdEncoding.DecodeString(sr.Return.OutData)
+			errB, _ := base64.StdEncoding.DecodeString(sr.Return.ErrData)
+			return code, string(outB), string(errB), nil
+		}
+		if time.Now().After(deadline) {
+			return 0, "", "", fmt.Errorf("timed out after %s waiting on pid %d", o.timeout, er.Return.Pid)
+		}
+		time.Sleep(o.interval)
+	}
+}
+
+// zipDir writes a zip of srcDir's CONTENTS (entries relative to srcDir, so the
+// archive has no top-level folder) to zipPath. Empty directories are kept.
+func zipDir(srcDir, zipPath string) error {
+	zf, err := os.Create(zipPath)
+	if err != nil {
+		return err
+	}
+	defer zf.Close()
+	zw := zip.NewWriter(zf)
+	defer zw.Close()
+	srcDir = filepath.Clean(srcDir)
+	return filepath.Walk(srcDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if p == srcDir {
+			return nil
+		}
+		rel, err := filepath.Rel(srcDir, p)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if info.IsDir() {
+			_, err := zw.Create(rel + "/")
+			return err
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		w, err := zw.Create(rel)
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(w, f)
+		return err
+	})
+}
+
+// runPutDir copies a local directory into a Windows guest: zips the contents
+// in-process (no local zip tool needed), pushes the archive with the same file
+// RPCs as -put, expands it with Expand-Archive at dest, and removes the archive.
+func runPutDir(o *opts, localDir, dest string) error {
+	info, err := os.Stat(localDir)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", localDir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory; use -put for a single file", localDir)
+	}
+	if !strings.Contains(dest, "\\") {
+		return fmt.Errorf("-put-dir targets a Windows guest: -dest must be a Windows path like 'C:\\dir'")
+	}
+
+	tmp, err := os.CreateTemp("", "guest-run-putdir-*.zip")
+	if err != nil {
+		return fmt.Errorf("creating temp archive: %w", err)
+	}
+	tmp.Close()
+	defer os.Remove(tmp.Name())
+	if err := zipDir(localDir, tmp.Name()); err != nil {
+		return fmt.Errorf("archiving %s: %w", localDir, err)
+	}
+
+	const guestZip = `C:\Windows\Temp\guest-run-putdir.zip`
+	if err := runPut(o, tmp.Name(), guestZip); err != nil {
+		return fmt.Errorf("pushing the archive: %w", err)
+	}
+
+	ps := "$ErrorActionPreference='Stop'; " +
+		"New-Item -ItemType Directory -Path " + psSingleQuote(dest) + " -Force | Out-Null; " +
+		"Expand-Archive -LiteralPath " + psSingleQuote(guestZip) + " -DestinationPath " + psSingleQuote(dest) + " -Force"
+	cmdPath, cmdArgs, _ := powershell(ps)
+	code, _, errData, err := o.execAndWait(cmdPath, cmdArgs)
+
+	// Best-effort: remove the pushed archive whether or not the expand worked.
+	cp, ca, _ := powershell("Remove-Item -LiteralPath " + psSingleQuote(guestZip) + " -Force -ErrorAction SilentlyContinue")
+	_, _, _, _ = o.execAndWait(cp, ca)
+
+	if err != nil {
+		return fmt.Errorf("expanding on the guest: %w", err)
+	}
+	if code != 0 {
+		return fmt.Errorf("Expand-Archive failed on the guest (exit %d): %s", code, strings.TrimSpace(errData))
+	}
+	fmt.Fprintf(os.Stderr, "guest-run: copied directory %s into %s\n", localDir, dest)
+	return nil
 }
